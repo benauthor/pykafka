@@ -490,9 +490,6 @@ class SimpleConsumer():
                         " to {offset}".format(
                             id_=owned_partition.partition.id, offset=given_offset))
                     owned_partition.set_offset(given_offset)
-                # release locks on succeeded partitions to allow fetching
-                # to resume
-                owned_partition.fetch_lock.release()
 
         if partition_offsets is None:
             partition_offsets = [(a, self._auto_offset_reset)
@@ -508,51 +505,52 @@ class SimpleConsumer():
         log.info("Resetting offsets for %s partitions", len(list(owned_partition_offsets)))
 
         for i in range(self._offsets_reset_max_retries):
+            time.sleep(i * (self._offsets_channel_backoff_ms / 1000.0))
+            sorted_offsets = sorted(iteritems(owned_partition_offsets), key=lambda k: k[0].partition.id)
             # group partitions by leader
             by_leader = defaultdict(list)
-            for partition, offset in iteritems(owned_partition_offsets):
-                # acquire lock for each partition to stop fetching during offset
-                # reset
-                if partition.fetch_lock.acquire(True):
-                    # empty the queue for this partition to avoid sending
-                    # emitting messages from the old offset
-                    partition.flush()
-                    by_leader[partition.partition.leader].append((partition, offset))
+            locks_acquired = []
+            try:
+                for partition, offset in sorted_offsets:
+                    # acquire lock for each partition to stop fetching during offset
+                    # reset
+                    if partition.fetch_lock.acquire(True):
+                        locks_acquired.append(partition.fetch_lock)
+                        # empty the queue for this partition to avoid sending
+                        # emitting messages from the old offset
+                        partition.flush()
+                        by_leader[partition.partition.leader].append((partition, offset))
 
-            # get valid offset ranges for each partition
-            for broker, offsets in iteritems(by_leader):
-                reqs = [owned_partition.build_offset_request(offset)
-                        for owned_partition, offset in offsets]
-                response = broker.request_offset_limits(reqs)
-                parts_by_error = handle_partition_responses(
-                    self._default_error_handlers,
-                    response=response,
-                    success_handler=_handle_success,
-                    partitions_by_id=self._partitions_by_id)
+                # get valid offset ranges for each partition
+                for broker, offsets in iteritems(by_leader):
+                    reqs = [owned_partition.build_offset_request(offset)
+                            for owned_partition, offset in offsets]
+                    response = broker.request_offset_limits(reqs)
+                    parts_by_error = handle_partition_responses(
+                        self._default_error_handlers,
+                        response=response,
+                        success_handler=_handle_success,
+                        partitions_by_id=self._partitions_by_id)
 
-                if 0 in parts_by_error:
-                    # drop successfully reset partitions for next retry
-                    successful = [part for part, _ in parts_by_error.pop(0)]
-                    # py3 creates a generate so we need to evaluate this
-                    # operation
-                    list(map(owned_partition_offsets.pop, successful))
-                if not parts_by_error:
-                    continue
-                log.error("Error resetting offsets for topic %s (errors: %s)",
-                          self._topic.name,
-                          {ERROR_CODES[err]: [op.partition.id for op, _ in parts]
-                           for err, parts in iteritems(parts_by_error)})
+                    if 0 in parts_by_error:
+                        # drop successfully reset partitions for next retry
+                        successful = [part for part, _ in parts_by_error.pop(0)]
+                        # py3 creates a generate so we need to evaluate this
+                        # operation
+                        list(map(owned_partition_offsets.pop, successful))
+                    
+                    if parts_by_error:
+                        log.error("Error resetting offsets for topic %s (errors: %s)",
+                                  self._topic.name,
+                                  {ERROR_CODES[err]: [op.partition.id for op, _ in parts]
+                                   for err, parts in iteritems(parts_by_error)})
 
-                time.sleep(i * (self._offsets_channel_backoff_ms / 1000))
-
-                for errcode, owned_partitions in iteritems(parts_by_error):
-                    if errcode != 0:
-                        for owned_partition in owned_partitions:
-                            owned_partition.fetch_lock.release()
-
-            if not owned_partition_offsets:
-                break
-            log.debug("Retrying offset reset")
+                if not owned_partition_offsets:
+                    break
+                log.debug("Retrying offset reset")
+            finally:
+                for lock in locks_acquired:
+                    lock.release()
 
         if owned_partition_offsets:
             raise OffsetRequestFailedError("reset_offsets failed after %d "
@@ -580,56 +578,44 @@ class SimpleConsumer():
 
         for broker, owned_partitions in iteritems(self._partitions_by_leader):
             partition_reqs = {}
-            for owned_partition in owned_partitions:
-                # attempt to acquire lock, just pass if we can't
-                if owned_partition.fetch_lock.acquire(False):
-                    partition_reqs[owned_partition] = None
-                    if owned_partition.message_count < self._queued_max_messages:
-                        fetch_req = owned_partition.build_fetch_request(
-                            self._fetch_message_max_bytes)
-                        partition_reqs[owned_partition] = fetch_req
-                    else:
-                        log.debug("Partition %s above max queued count (queue has %d)",
-                                  owned_partition.partition.id,
-                                  owned_partition.message_count)
-            if partition_reqs:
-                try:
-                    response = broker.fetch_messages(
-                        [a for a in itervalues(partition_reqs) if a],
-                        timeout=self._fetch_wait_max_ms,
-                        min_bytes=self._fetch_min_bytes
-                    )
-                except SocketDisconnectedError:
-                    # If the broker dies while we're supposed to stop,
-                    # it's fine, and probably an integration test.
-                    if not self._running:
-                        return
-                    else:
-                        raise
+            locks_acquired = []
+            try:
+                for owned_partition in owned_partitions:
+                    # attempt to acquire lock, just pass if we can't
+                    if owned_partition.fetch_lock.acquire(False):
+                        locks_acquired.append(owned_partition.fetch_lock)
+                        partition_reqs[owned_partition] = None
+                        if owned_partition.message_count < self._queued_max_messages:
+                            fetch_req = owned_partition.build_fetch_request(
+                                self._fetch_message_max_bytes)
+                            partition_reqs[owned_partition] = fetch_req
+                        else:
+                            log.debug("Partition %s above max queued count (queue has %d)",
+                                      owned_partition.partition.id,
+                                      owned_partition.message_count)
+                if partition_reqs:
+                    try:
+                        response = broker.fetch_messages(
+                            [a for a in itervalues(partition_reqs) if a],
+                            timeout=self._fetch_wait_max_ms,
+                            min_bytes=self._fetch_min_bytes
+                        )
+                    except SocketDisconnectedError:
+                        # If the broker dies while we're supposed to stop,
+                        # it's fine, and probably an integration test.
+                        if not self._running:
+                            return
+                        else:
+                            raise
 
-                parts_by_error = build_parts_by_error(response, self._partitions_by_id)
-                # release the lock in these cases, since resolving the error
-                # requires an offset reset and not releasing the lock would
-                # lead to a deadlock in reset_offsets. For successful requests
-                # or requests with different errors, we still assume that
-                # it's ok to retain the lock since no offset_reset can happen
-                # before this function returns
-                out_of_range = parts_by_error.get(OffsetOutOfRangeError.ERROR_CODE, [])
-                for owned_partition, res in out_of_range:
-                    owned_partition.fetch_lock.release()
-                    # remove them from the dict of partitions to unlock to avoid
-                    # double-unlocking
-                    partition_reqs.pop(owned_partition)
-                # handle the rest of the errors that don't require deadlock
-                # management
-                handle_partition_responses(
-                    self._default_error_handlers,
-                    parts_by_error=parts_by_error,
-                    success_handler=_handle_success)
-                # unlock the rest of the partitions
-                for owned_partition in iterkeys(partition_reqs):
-                    owned_partition.fetch_lock.release()
-
+                    parts_by_error = build_parts_by_error(response, self._partitions_by_id)
+                    handle_partition_responses(
+                        self._default_error_handlers,
+                        parts_by_error=parts_by_error,
+                        success_handler=_handle_success)
+            finally:
+                for lock in locks_acquired:
+                    lock.release()
 
 class OwnedPartition(object):
     """A partition that is owned by a SimpleConsumer.
@@ -652,7 +638,7 @@ class OwnedPartition(object):
         self._messages_arrived = semaphore
         self.last_offset_consumed = 0
         self.next_offset = 0
-        self.fetch_lock = threading.Lock()
+        self.fetch_lock = threading.RLock()
 
     @property
     def message_count(self):
