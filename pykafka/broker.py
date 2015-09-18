@@ -18,6 +18,7 @@ limitations under the License.
 """
 __all__ = ["Broker"]
 import logging
+from threading import Lock
 import time
 
 from .connection import BrokerConnection
@@ -76,7 +77,9 @@ class Broker():
             socket connections
         :type source_port: int
         """
+        self._connection_lock = Lock()
         self._connection = None
+        self._offsets_channel_lock = Lock()
         self._offsets_channel_connection = None
         self._id = int(id_)
         self._host = host
@@ -89,6 +92,7 @@ class Broker():
         self._socket_timeout_ms = socket_timeout_ms
         self._offsets_channel_socket_timeout_ms = offsets_channel_socket_timeout_ms
         self._buffer_size = buffer_size
+
         self.connect()
 
     def __repr__(self):
@@ -196,16 +200,25 @@ class Broker():
         if self.connected:
             return
 
-        if self._connection:
-            self._connection.reconnect()
-        else:
-            self._connection = BrokerConnection(self.host, self.port,
-                                                buffer_size=self._buffer_size,
-                                                source_host=self._source_host,
-                                                source_port=self._source_port)
-            self._connection.connect(self._socket_timeout_ms)
-            self._req_handler = RequestHandler(self._handler, self._connection)
-            self._req_handler.start()
+        with self._connection_lock:
+            if self._connection:
+                self._connection.reconnect()
+            else:
+                self._connection = BrokerConnection(self.host, self.port,
+                                                    buffer_size=self._buffer_size,
+                                                    source_host=self._source_host,
+                                                    source_port=self._source_port)
+                self._connection.connect(self._socket_timeout_ms)
+                self._req_handler = RequestHandler(self._handler, self._connection)
+                self._req_handler.start()
+
+    def disconnect(self):
+        with self._connection_lock:
+            if self.connected:
+                self._connection.disconnect()
+        with self._offsets_channel_lock:
+            if self.offsets_channel_connected:
+                self._offsets_channel.disconnect()
 
     def connect_offsets_channel(self):
         """Establish a connection to the Broker for the offsets channel
@@ -214,14 +227,20 @@ class Broker():
         :class:`pykafka.handlers.RequestHandler` for this broker's offsets
         channel
         """
-        self._offsets_channel_connection = BrokerConnection(
-            self.host, self.port, buffer_size=self._buffer_size,
-            source_host=self._source_host, source_port=self._source_port)
-        self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
-        self._offsets_channel_req_handler = RequestHandler(
-            self._handler, self._offsets_channel_connection
-        )
-        self._offsets_channel_req_handler.start()
+        if self.offsets_channel_connected:
+            return
+        with self._offsets_channel_lock:
+            if self._offsets_channel_connection:
+                self._offsets_channel_connection.reconnect()
+            else:
+                self._offsets_channel_connection = BrokerConnection(
+                    self.host, self.port, buffer_size=self._buffer_size,
+                    source_host=self._source_host, source_port=self._source_port)
+                self._offsets_channel_connection.connect(self._offsets_channel_socket_timeout_ms)
+                self._offsets_channel_req_handler = RequestHandler(
+                    self._handler, self._offsets_channel_connection
+                )
+                self._offsets_channel_req_handler.start()
 
     def fetch_messages(self,
                        partition_requests,
@@ -301,9 +320,6 @@ class Broker():
             break
 
         return response
-
-    def reconnect():
-        pass
 
 
     ######################

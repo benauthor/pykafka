@@ -156,6 +156,7 @@ class Cluster(object):
                         "unable to fetch metadata from broker %s",
                         broker)
                     try:
+                        log.warning("speculatively disconnecting broker...")
                         broker.disconnect()
                     except:
                         log.exception("error disconnecting broker")
@@ -214,7 +215,7 @@ class Cluster(object):
                 broker = self._brokers[id_]
                 if not broker.connected:
                     log.warning("disconnected active broker, reconnecting...")
-                    broker.reconnect()
+                    broker.connect()
 
                 if meta.host == broker.host and meta.port == broker.port:
                     continue  # no changes
