@@ -144,7 +144,7 @@ class Broker():
         """Returns True if this object's main connection to the Kafka broker
             is active
         """
-        return self._connection.connected
+        return self._connection and self._connection.connected
 
     @property
     def offsets_channel_connected(self):
@@ -193,13 +193,19 @@ class Broker():
         Creates a new :class:`pykafka.connection.BrokerConnection` and a new
         :class:`pykafka.handlers.RequestHandler` for this broker
         """
-        self._connection = BrokerConnection(self.host, self.port,
-                                            buffer_size=self._buffer_size,
-                                            source_host=self._source_host,
-                                            source_port=self._source_port)
-        self._connection.connect(self._socket_timeout_ms)
-        self._req_handler = RequestHandler(self._handler, self._connection)
-        self._req_handler.start()
+        if self.connected:
+            return
+
+        if self._connection:
+            self._connection.reconnect()
+        else:
+            self._connection = BrokerConnection(self.host, self.port,
+                                                buffer_size=self._buffer_size,
+                                                source_host=self._source_host,
+                                                source_port=self._source_port)
+            self._connection.connect(self._socket_timeout_ms)
+            self._req_handler = RequestHandler(self._handler, self._connection)
+            self._req_handler.start()
 
     def connect_offsets_channel(self):
         """Establish a connection to the Broker for the offsets channel
@@ -274,6 +280,7 @@ class Broker():
         :type topics: Iterable of int
         """
         max_retries = 3
+        response = None
         for i in range(max_retries):
             if i > 0:
                 log.debug("Retrying")
@@ -285,11 +292,19 @@ class Broker():
             for name, topic_metadata in iteritems(response.topics):
                 if topic_metadata.err == LeaderNotAvailable.ERROR_CODE:
                     log.warning("Leader not available for topic '%s'.", name)
+                    continue
                 for pid, partition_metadata in iteritems(topic_metadata.partitions):
                     if partition_metadata.err == LeaderNotAvailable.ERROR_CODE:
                         log.warning("Leader not available for topic '%s' partition %d.",
                                     name, pid)
-            return response
+                        continue
+            break
+
+        return response
+
+    def reconnect():
+        pass
+
 
     ######################
     #  Commit/Fetch API  #

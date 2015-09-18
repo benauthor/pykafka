@@ -147,26 +147,36 @@ class Cluster(object):
         brokers = [b for b in self.brokers.values() if b.connected]
         if brokers:
             for broker in brokers:
-                response = broker.request_metadata()
-                if response is not None:
-                    return response
-        else:  # try seed hosts
-            brokers = self._seed_hosts.split(',')
-            for broker_str in brokers:
                 try:
-                    h, p = broker_str.split(':')
-                    broker = Broker(-1, h, int(p), self._handler,
-                                    self._socket_timeout_ms,
-                                    self._offsets_channel_socket_timeout_ms,
-                                    buffer_size=1024 * 1024,
-                                    source_host=self._source_host,
-                                    source_port=self._source_port)
                     response = broker.request_metadata()
                     if response is not None:
                         return response
-                except Exception as e:
-                    log.error('Unable to connect to broker %s', broker_str)
-                    log.exception(e)
+                except Exception:
+                    log.exception(
+                        "unable to fetch metadata from broker %s",
+                        broker)
+                    try:
+                        broker.disconnect()
+                    except:
+                        log.exception("error disconnecting broker")
+
+        brokers = self._seed_hosts.split(',')
+        for broker_str in brokers:
+            try:
+                h, p = broker_str.split(':')
+                broker = Broker(-1, h, int(p), self._handler,
+                                self._socket_timeout_ms,
+                                self._offsets_channel_socket_timeout_ms,
+                                buffer_size=1024 * 1024,
+                                source_host=self._source_host,
+                                source_port=self._source_port)
+                response = broker.request_metadata()
+                if response is not None:
+                    return response
+            except Exception as e:
+                log.error('Unable to connect to broker %s', broker_str)
+                log.exception(e)
+
         # Couldn't connect anywhere. Raise an error.
         raise RuntimeError(
             'Unable to connect to a broker to fetch metadata. See logs.')
@@ -181,6 +191,7 @@ class Cluster(object):
         # FIXME: A cluster with no topics returns no brokers in metadata
         # Remove old brokers
         removed = set(self._brokers.keys()) - set(broker_metadata.keys())
+
         if len(removed) > 0:
             log.info('Removing %d brokers', len(removed))
         for id_ in removed:
@@ -201,6 +212,10 @@ class Cluster(object):
                 )
             else:
                 broker = self._brokers[id_]
+                if not broker.connected:
+                    log.warning("disconnected active broker, reconnecting...")
+                    broker.reconnect()
+
                 if meta.host == broker.host and meta.port == broker.port:
                     continue  # no changes
                 # TODO: Can brokers update? Seems like a problem if so.

@@ -68,6 +68,9 @@ class PartitionOwnedError(KafkaException):
         self.partition = partition
 
 
+class ClusterUpdateFailure(KafkaException):
+    """Indicates failure to update cluster metadata"""
+
 # Protocol Client Exceptions
 # https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-ErrorCodes
 

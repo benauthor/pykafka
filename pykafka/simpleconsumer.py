@@ -20,8 +20,10 @@ limitations under the License.
 __all__ = ["SimpleConsumer"]
 import itertools
 import logging
+import sys
 import time
 import threading
+import traceback
 from collections import defaultdict
 
 from .common import OffsetType
@@ -154,6 +156,9 @@ class SimpleConsumer():
         self._auto_commit_interval_ms = auto_commit_interval_ms
         self._last_auto_commit = time.time()
 
+        self._worker_exception = None
+        self._worker_trace_logged = False
+
         self._discover_offset_manager()
 
         if partitions:
@@ -185,12 +190,27 @@ class SimpleConsumer():
             group=self._consumer_group
         )
 
+    def _raise_worker_exceptions(self):
+        """Raises exceptions encountered on worker threads"""
+        if self._worker_exception is not None:
+            _, ex, tb = self._worker_exception
+            # avoid logging worker exceptions more than once, which can
+            # happen when this function's `raise` triggers `__exit__`
+            # which calls `stop`
+            if not self._worker_trace_logged:
+                self._worker_trace_logged = True
+                log.error("Exception encountered in worker thread:\n%s",
+                          "".join(traceback.format_tb(tb)))
+            raise ex
+
     def start(self):
         """Begin communicating with Kafka, including setting up worker threads
 
         Fetches offsets, starts an offset autocommitter worker pool, and
         starts a message fetcher worker pool.
         """
+        self._raise_worker_exceptions()
+
         self._running = True
 
         # Figure out which offset wer're starting on
@@ -203,6 +223,8 @@ class SimpleConsumer():
 
         if self._auto_commit_enable:
             self._autocommit_worker_thread = self._setup_autocommit_worker()
+
+        self._raise_worker_exceptions()
 
     def _build_default_error_handlers(self):
         """Set up the error handlers to use for partition errors."""
@@ -260,11 +282,15 @@ class SimpleConsumer():
         """Start the autocommitter thread"""
         def autocommitter():
             while True:
-                if not self._running:
+                try:
+                    if not self._running:
+                        break
+                    if self._auto_commit_enable:
+                        self._auto_commit()
+                    time.sleep(self._auto_commit_interval_ms / 1000)
+                except Exception:
+                    self._worker_exception = sys.exc_info()
                     break
-                if self._auto_commit_enable:
-                    self._auto_commit()
-                time.sleep(self._auto_commit_interval_ms / 1000)
             log.debug("Autocommitter thread exiting")
         log.debug("Starting autocommitter thread")
         return self._cluster.handler.spawn(autocommitter)
@@ -273,11 +299,16 @@ class SimpleConsumer():
         """Start the fetcher threads"""
         def fetcher():
             while True:
-                if not self._running:
+                try:
+                    if not self._running:
+                        break
+                    self.fetch()
+                    time.sleep(0.0001)
+                except Exception:
+                    self._worker_exception = sys.exc_info()
                     break
-                self.fetch()
-                time.sleep(.0001)
             log.debug("Fetcher thread exiting")
+        
         log.info("Starting %s fetcher threads", self._num_consumer_fetchers)
         return [self._cluster.handler.spawn(fetcher)
                 for i in range(self._num_consumer_fetchers)]
@@ -299,11 +330,12 @@ class SimpleConsumer():
         timeout = None
         if block:
             if self._consumer_timeout_ms > 0:
-                timeout = float(self._consumer_timeout_ms) / 1000
+                timeout = float(self._consumer_timeout_ms) / 1000.0
             else:
                 timeout = 1.0
 
         while True:
+            self._raise_worker_exceptions()
             if self._messages_arrived.acquire(blocking=block, timeout=timeout):
                 # by passing through this semaphore, we know that at
                 # least one message is waiting in some queue.
@@ -335,6 +367,8 @@ class SimpleConsumer():
 
         Uses the offset commit/fetch API
         """
+        self._raise_worker_exceptions()
+
         if not self._consumer_group:
             raise Exception("consumer group must be specified to commit offsets")
 
@@ -344,7 +378,7 @@ class SimpleConsumer():
         for i in range(self._offsets_commit_max_retries):
             if i > 0:
                 log.debug("Retrying")
-            time.sleep(i * (self._offsets_channel_backoff_ms / 1000))
+            time.sleep(i * (self._offsets_channel_backoff_ms / 1000.0))
 
             response = self._offset_manager.commit_consumer_group_offsets(
                 self._consumer_group, 1, b'pykafka', reqs)
@@ -376,6 +410,8 @@ class SimpleConsumer():
         :return: List of (id, :class:`pykafka.protocol.OffsetFetchPartitionResponse`)
             tuples
         """
+        self._raise_worker_exceptions()
+
         if not self._consumer_group:
             raise Exception("consumer group must be specified to fetch offsets")
 
@@ -432,7 +468,7 @@ class SimpleConsumer():
                       {ERROR_CODES[err]: [op.partition.id for op, _ in parts]
                        for err, parts in iteritems(parts_by_error)})
 
-            time.sleep(i * (self._offsets_channel_backoff_ms / 1000))
+            time.sleep(i * (self._offsets_channel_backoff_ms / 1000.0))
 
             # retry only specific error responses
             to_retry = []
@@ -462,6 +498,8 @@ class SimpleConsumer():
         for more information on what kafka treats as a valid offset timestamp:
         https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-OffsetRequest
         """
+        self._raise_worker_exceptions()
+
         def _handle_success(parts):
             for owned_partition, pres in parts:
                 if len(pres.offset) > 0:

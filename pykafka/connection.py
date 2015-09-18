@@ -102,7 +102,12 @@ class BrokerConnection(object):
         bytes = request.get_bytes()
         if not self._socket:
             raise SocketDisconnectedError
-        self._socket.sendall(bytes)
+        try:
+            self._socket.sendall(bytes)
+        except Exception:
+            log.exception("Unexpected error sending request")
+            self.disconnect()
+            raise SocketDisconnectedError()
 
     def response(self):
         """Wait for a response from the broker"""
@@ -111,6 +116,11 @@ class BrokerConnection(object):
             # Happens when broker has shut down
             self.disconnect()
             raise SocketDisconnectedError
-        size = struct.unpack('!i', size)[0]
-        recvall_into(self._socket, self._buff, size)
-        return buffer(self._buff[4:4 + size])
+        try:
+            size = struct.unpack('!i', size)[0]
+            recvall_into(self._socket, self._buff, size)
+            return buffer(self._buff[4:4 + size])
+        except:
+            log.exception("Unexpected error reading broker response")
+            self.disconnect()
+            raise SocketDisconnectedError()
