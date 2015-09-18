@@ -21,6 +21,7 @@ __all__ = ["Cluster"]
 import logging
 import random
 import time
+from threading import Lock
 import weakref
 
 from .broker import Broker
@@ -116,6 +117,7 @@ class Cluster(object):
         self._source_port = 0
         if ':' in self._source_address:
             self._source_port = int(self._source_address.split(':')[1])
+        self._update_lock = Lock()
         self.update()
 
     def __repr__(self):
@@ -292,15 +294,16 @@ class Cluster(object):
 
     def update(self):
         """Update known brokers and topics."""
-        metadata = self._get_metadata()
-        if len(metadata.brokers) == 0 and len(metadata.topics) == 0:
-            log.warning('No broker metadata found. If this is a fresh cluster, '
-                        'this may be due to a bug in Kafka. You can force '
-                        'broker metadata to be returned by manually creating '
-                        'a topic in the cluster. See '
-                        'https://issues.apache.org/jira/browse/KAFKA-2154 '
-                        'for information. Please note: topic auto-creation '
-                        'will NOT work. You need to create at least one topic '
-                        'manually using the Kafka CLI tools.')
-        self._update_brokers(metadata.brokers)
-        self._update_topics(metadata.topics)
+        with self._update_lock:
+            metadata = self._get_metadata()
+            if len(metadata.brokers) == 0 and len(metadata.topics) == 0:
+                log.warning('No broker metadata found. If this is a fresh cluster, '
+                            'this may be due to a bug in Kafka. You can force '
+                            'broker metadata to be returned by manually creating '
+                            'a topic in the cluster. See '
+                            'https://issues.apache.org/jira/browse/KAFKA-2154 '
+                            'for information. Please note: topic auto-creation '
+                            'will NOT work. You need to create at least one topic '
+                            'manually using the Kafka CLI tools.')
+            self._update_brokers(metadata.brokers)
+            self._update_topics(metadata.topics)

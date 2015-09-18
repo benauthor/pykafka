@@ -651,6 +651,13 @@ class SimpleConsumer():
                         self._default_error_handlers,
                         parts_by_error=parts_by_error,
                         success_handler=_handle_success)
+            except SocketDisconnectedError:
+                log.warning("Broker %s is not connected", broker)
+                self._cluster.update()
+            except Exception:
+                log.exception("Unexpected error communicating with broker %s", broker)
+                broker.disconnect()
+                self._cluster.update()
             finally:
                 for lock in locks_acquired:
                     lock.release()
