@@ -202,7 +202,7 @@ class Broker():
 
         with self._connection_lock:
             if self._connection:
-                self._connection.reconnect()
+                self._connection.reconnect(self._socket_timeout_ms)
             else:
                 self._connection = BrokerConnection(self.host, self.port,
                                                     buffer_size=self._buffer_size,
@@ -231,7 +231,7 @@ class Broker():
             return
         with self._offsets_channel_lock:
             if self._offsets_channel_connection:
-                self._offsets_channel_connection.reconnect()
+                self._offsets_channel_connection.reconnect(self._offsets_channel_socket_timeout_ms)
             else:
                 self._offsets_channel_connection = BrokerConnection(
                     self.host, self.port, buffer_size=self._buffer_size,

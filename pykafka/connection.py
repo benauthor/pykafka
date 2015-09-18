@@ -77,7 +77,7 @@ class BrokerConnection(object):
         """Connect to the broker."""
         self._socket = socket.create_connection(
             (self.host, self.port),
-            timeout / 1000,
+            timeout / 1000.0,
             (self.source_host, self.source_port)
         )
 
@@ -92,10 +92,10 @@ class BrokerConnection(object):
         finally:
             self._socket = None
 
-    def reconnect(self):
+    def reconnect(self, timeout):
         """Disconnect from the broker, then reconnect"""
         self.disconnect()
-        self.connect()
+        self.connect(timeout)
 
     def request(self, request):
         """Send a request over the socket connection"""
